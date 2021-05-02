@@ -4,64 +4,59 @@ extern crate serde;
 //
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 //
+use std::{
+    fs,
+    io::{self, prelude::*},
+    path,
+};
+//
+pub enum Input {
+    Stdin(io::Stdin),
+    Paths {
+        paths: Vec<path::PathBuf>,
+        buffer: io::BufReader<fs::File>,
+    },
+}
 
-mod glob {
-    //! Functions to handle reading data from file.
-    use super::Result;
-    use glob::glob;
-    use std::{
-        fs,
-        io::{prelude::*, BufReader},
-    };
-
-    /// FileInput struct is created using a glob string and can be iterated over for strings representing lines in matching files.
-    pub struct FileInput {
-        // glob_str: String,
-        paths: glob::Paths,
-        current_reader: BufReader<fs::File>,
-    }
-
-    impl FileInput {
-        /// Creates a file FileInput struct, will panic if glob fails to be created and print error.
-        pub fn new(glob_str: &str) -> Result<Self> {
-            let mut paths = glob(glob_str)?;
-            let first_path = match paths.next() {
-                Some(res) => res?,
-                None => return Err(format!("{} did not return any files", glob_str).into()),
-            };
-            // Create a reader from first glob
-            let file = fs::OpenOptions::new().read(true).open(first_path)?;
-            let current_reader = BufReader::new(file);
-            // Return Self
-            Ok(Self {
-                // glob_str: glob_str.to_string(),
+impl Input {
+    pub fn from_paths(mut paths: Vec<path::PathBuf>) -> Result<Self> {
+        match paths.pop() {
+            None => Ok(Self::Stdin(io::stdin())),
+            Some(p) => Ok(Self::Paths {
                 paths,
-                current_reader,
-            })
+                buffer: io::BufReader::new(fs::OpenOptions::new().read(true).open(p)?),
+            }),
         }
+    }
+}
 
-        pub fn read_line(&mut self) -> Result<Option<String>> {
-            // Check self.current_reader for data
-            let mut line = String::new();
-            if self.current_reader.read_line(&mut line)? == 0 {
-                match self.paths.next() {
-                    Some(p) => {
-                        // Create a BufReader
-                        let file = fs::OpenOptions::new().read(true).open(p?)?;
-                        let mut reader = BufReader::new(file);
-                        // Read line
-                        let mut line = String::new();
-                        let _ = reader.read_line(&mut line)?;
-                        // Store reader
-                        self.current_reader = reader;
+impl Iterator for Input {
+    type Item = Result<String>;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Stdin(stdin) => stdin.lock().lines().next().map(|r| r.map_err(|e| e.into())),
+            Self::Paths {
+                ref mut paths,
+                ref mut buffer,
+            } => {
+                // Try read from buffer
+                let mut line = String::new();
+                match buffer.read_line(&mut line) {
+                    Err(_) | Ok(0) => {
+                        match paths.pop() {
+                            Some(p) => {
+                                // Create a BufReader
+                                match fs::OpenOptions::new().read(true).open(p) {
+                                    Ok(f) => *buffer = io::BufReader::new(f),
+                                    Err(e) => return Some(Err(e.into())),
+                                }
+                                self.next()
+                            }
+                            None => None,
+                        }
                     }
-                    None => return Ok(None),
+                    Ok(_) => Some(Ok(line)),
                 }
-            }
-
-            match line.is_empty() {
-                false => Ok(Some(line)),
-                true => Ok(None),
             }
         }
     }
@@ -145,7 +140,7 @@ mod grok_parser {
         collections::BTreeMap,
         fs,
         io::{prelude::*, BufReader},
-        path::PathBuf,
+        path,
     };
 
     /// GrokParser struct is used to read a Matches from a String.
@@ -156,7 +151,11 @@ mod grok_parser {
     }
 
     impl GrokParser {
-        pub fn new(pattern: &str, patterns: Option<&PathBuf>, no_patterns: bool) -> Result<Self> {
+        pub fn new(
+            pattern: &str,
+            patterns: Option<&path::PathBuf>,
+            no_patterns: bool,
+        ) -> Result<Self> {
             let mut grok = match patterns {
                 Some(d) => {
                     //
@@ -199,7 +198,7 @@ mod grok_parser {
         }
     }
 
-    fn read_aliases(patterns: &PathBuf) -> Result<BTreeMap<String, String>> {
+    fn read_aliases(patterns: &path::Path) -> Result<BTreeMap<String, String>> {
         let mut aliases = BTreeMap::new();
         if !patterns.is_dir() && patterns.exists() {
             return Err(
@@ -235,19 +234,15 @@ mod stats {
 }
 
 mod args {
-    //! StructOpt argument functions.
     use std::path::PathBuf;
     use structopt::StructOpt;
-    #[derive(Debug, StructOpt)]
+
+    #[derive(StructOpt)]
     #[structopt(name = "grok", about = "Parse structured data using grok filters.")]
-    pub struct Options {
+    pub struct Opt {
         /// Pattern to match on
         #[structopt(short, long)]
         pub pattern: String,
-        /// Input file glob, can match on multiple files.
-        #[structopt(short, long)]
-        pub input: String,
-        /// Output file, stdout if not provided.
         #[structopt(short, long, parse(from_os_str))]
         pub output: Option<PathBuf>,
         /// Custom patterns directory, uses defaults is not provided.
@@ -269,19 +264,21 @@ mod args {
         // * Pattern Dictionary (ie. A root pattern and varients)
         // * Matching multiple patterns and testing for a match
         // * Stats on matched and failed lines and logging failures (or eprint if no output file is provided)
+        #[structopt(parse(from_os_str))]
+        pub files: Vec<PathBuf>,
     }
 }
 
 fn main() -> Result<()> {
     use structopt::StructOpt;
-    let opt = args::Options::from_args();
+    let opt = args::Opt::from_args();
     // Check json and csv options are not both being used.
     if opt.json && opt.csv {
         eprintln!("Select either JSON or CSV but not both options to output");
         std::process::exit(1);
     }
     // Get a file input handle.
-    let mut file_in = match glob::FileInput::new(&opt.input) {
+    let mut input = match Input::from_paths(opt.files) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("FileInput: {}", e);
@@ -311,7 +308,7 @@ fn main() -> Result<()> {
     // Generate a stats component.
     let mut stats = stats::Stats::default();
     let mut headers = Vec::new();
-    while let Ok(Some(a)) = file_in.read_line() {
+    while let Some(Ok(a)) = input.next() {
         let parsed = match grok_parser.parse(&a, &mut stats) {
             Ok(p) => p,
             Err(e) => {
@@ -326,12 +323,10 @@ fn main() -> Result<()> {
                 headers = parsed.keys().map(|k| format!("\"{}\"", k)).collect();
                 headers.sort();
                 output.output(Ok(headers.join(", ").to_string()))?;
-                // println!("{}", headers.join(", "));
             }
             // Parse in order of vec, otherwise the resulting values are unordered.
             let values: Vec<String> = parsed.values().map(|v| format!("\"{}\"", v)).collect();
             output.output(Ok(values.join(", ").to_string()))?;
-            // println!("{}", values.join(", "));
         }
         // Print as JSON if option is true
         if opt.json {
